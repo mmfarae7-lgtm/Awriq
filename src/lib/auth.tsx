@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useState, useCallback, type ReactNode } from 'react'
+import { createContext, useContext, useEffect, useState, useCallback, useRef, type ReactNode } from 'react'
 import type { Session } from '@supabase/supabase-js'
 import { supabase } from './supabase'
 import type { Role, UserProfile } from '../types'
@@ -8,6 +8,7 @@ interface AuthContextType {
   profile: UserProfile | null
   roles: Role[]
   loading: boolean
+  authError: string | null
   signIn: (email: string, password: string) => Promise<{ error: string | null }>
   signUp: (email: string, password: string, fullName: string) => Promise<{ error: string | null }>
   signOut: () => Promise<void>
@@ -23,81 +24,147 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [profile, setProfile] = useState<UserProfile | null>(null)
   const [roles, setRoles] = useState<Role[]>([])
   const [loading, setLoading] = useState(true)
+  const [authError, setAuthError] = useState<string | null>(null)
+
+  const initializedRef = useRef(false)
+  const currentUserIdRef = useRef<string | null>(null)
 
   const loadProfile = useCallback(async (userId: string) => {
-    const { data: profileData } = await supabase
-      .from('user_profiles')
-      .select('*')
-      .eq('user_id', userId)
-      .maybeSingle()
+    if (currentUserIdRef.current === userId) return
+    currentUserIdRef.current = userId
 
-    if (profileData) {
-      setProfile(profileData as UserProfile)
-    } else {
-      const { data: newProfile } = await supabase
+    try {
+      const { data: profileData, error: profileError } = await supabase
         .from('user_profiles')
-        .insert({
-          user_id: userId,
-          full_name: '',
-          is_active: true,
-          last_login_at: new Date().toISOString(),
-        })
         .select('*')
+        .eq('user_id', userId)
         .maybeSingle()
-      if (newProfile) setProfile(newProfile as UserProfile)
-    }
 
-    const { data: userRoles } = await supabase
-      .from('user_roles')
-      .select('role_id, roles(*)')
-      .eq('user_id', userId)
+      if (profileError) {
+        setAuthError('فشل تحميل بيانات المستخدم')
+        setLoading(false)
+        return
+      }
 
-    if (userRoles) {
-      const roleList = userRoles.map((ur) => ur.roles).filter(Boolean) as unknown as Role[]
-      setRoles(roleList)
+      if (profileData) {
+        setProfile(profileData as UserProfile)
+      } else {
+        const { data: newProfile, error: insertError } = await supabase
+          .from('user_profiles')
+          .insert({
+            user_id: userId,
+            full_name: '',
+            is_active: true,
+            last_login_at: new Date().toISOString(),
+          })
+          .select('*')
+          .maybeSingle()
+        if (insertError) {
+          setAuthError('فشل إنشاء ملف المستخدم')
+          setLoading(false)
+          return
+        }
+        if (newProfile) setProfile(newProfile as UserProfile)
+      }
+
+      const { data: userRoles, error: rolesError } = await supabase
+        .from('user_roles')
+        .select('role_id, roles(*)')
+        .eq('user_id', userId)
+
+      if (rolesError) {
+        setAuthError('فشل تحميل صلاحيات المستخدم')
+        setLoading(false)
+        return
+      }
+
+      if (userRoles) {
+        const roleList = userRoles.map((ur) => ur.roles).filter(Boolean) as unknown as Role[]
+        setRoles(roleList)
+      }
+
+      setAuthError(null)
+    } catch {
+      setAuthError('حدث خطأ غير متوقع أثناء تحميل البيانات')
+    } finally {
+      setLoading(false)
     }
   }, [])
 
   const refreshProfile = useCallback(async () => {
-    if (session?.user?.id) {
-      await loadProfile(session.user.id)
+    const userId = currentUserIdRef.current
+    if (userId) {
+      currentUserIdRef.current = null
+      await loadProfile(userId)
     }
-  }, [session, loadProfile])
+  }, [loadProfile])
 
   useEffect(() => {
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      setSession(session)
-      if (session?.user?.id) {
-        loadProfile(session.user.id).finally(() => setLoading(false))
+    if (initializedRef.current) return
+    initializedRef.current = true
+
+    let mounted = true
+
+    supabase.auth.getSession().then(({ data, error }) => {
+      if (!mounted) return
+      if (error) {
+        setAuthError('فشل الاتصال بخدمة المصادقة')
+        setLoading(false)
+        return
+      }
+
+      setSession(data.session)
+      if (data.session?.user?.id) {
+        loadProfile(data.session.user.id)
       } else {
         setLoading(false)
       }
+    }).catch(() => {
+      if (!mounted) return
+      setAuthError('فشل الاتصال بخدمة المصادقة')
+      setLoading(false)
     })
 
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
-      setSession(session)
-      if (session?.user?.id) {
-        (async () => {
-          await loadProfile(session.user.id)
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, newSession) => {
+      if (!mounted) return
+
+      if (event === 'TOKEN_REFRESHED' && newSession?.user?.id === currentUserIdRef.current) {
+        setSession(newSession)
+        return
+      }
+
+      setSession(newSession)
+
+      if (newSession?.user?.id) {
+        if (newSession.user.id !== currentUserIdRef.current) {
+          currentUserIdRef.current = null
+          loadProfile(newSession.user.id)
+        } else {
           setLoading(false)
-        })()
+        }
       } else {
+        currentUserIdRef.current = null
         setProfile(null)
         setRoles([])
         setLoading(false)
       }
     })
 
-    return () => subscription.unsubscribe()
+    return () => {
+      mounted = false
+      subscription.unsubscribe()
+    }
   }, [loadProfile])
 
   const signIn = async (email: string, password: string) => {
+    setAuthError(null)
     const { error } = await supabase.auth.signInWithPassword({ email, password })
     if (error) return { error: error.message }
     return { error: null }
   }
 
   const signUp = async (email: string, password: string, fullName: string) => {
+    setAuthError(null)
     const { data, error } = await supabase.auth.signUp({ email, password })
     if (error) return { error: error.message }
 
@@ -113,6 +180,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const signOut = async () => {
     await supabase.auth.signOut()
+    currentUserIdRef.current = null
     setProfile(null)
     setRoles([])
   }
@@ -127,7 +195,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [roles])
 
   return (
-    <AuthContext.Provider value={{ session, profile, roles, loading, signIn, signUp, signOut, refreshProfile, hasPermission, hasRole }}>
+    <AuthContext.Provider value={{ session, profile, roles, loading, authError, signIn, signUp, signOut, refreshProfile, hasPermission, hasRole }}>
       {children}
     </AuthContext.Provider>
   )

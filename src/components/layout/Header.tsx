@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { Menu, Bell, Search, Maximize2, Minimize2, Sun, Moon, ChevronDown } from 'lucide-react'
 import { useAuth } from '../../lib/auth'
 import { useTheme } from '../../lib/theme'
@@ -14,6 +15,7 @@ interface HeaderProps {
 export default function Header({ onMenuClick, onToggleFullscreen, isFullscreen }: HeaderProps) {
   const { profile, roles, signOut } = useAuth()
   const { theme, toggleTheme } = useTheme()
+  const navigate = useNavigate()
   const [notifications, setNotifications] = useState<Notification[]>([])
   const [showNotifPanel, setShowNotifPanel] = useState(false)
   const [showUserMenu, setShowUserMenu] = useState(false)
@@ -307,7 +309,7 @@ export default function Header({ onMenuClick, onToggleFullscreen, isFullscreen }
                 {profile?.full_name || 'مستخدم'}
               </div>
               <button
-                onClick={() => { signOut(); window.location.href = '/login' }}
+                onClick={async () => { await signOut(); navigate('/login') }}
                 style={{
                   display: 'flex',
                   alignItems: 'center',

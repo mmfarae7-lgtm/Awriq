@@ -19,23 +19,36 @@ import ProjectsPage from './pages/ProjectsPage'
 import AccessTokensPage from './pages/AccessTokensPage'
 import SecurityPage from './pages/SecurityPage'
 
-function ProtectedRoutes() {
-  const { session, loading } = useAuth()
-
-  if (loading) {
-    return (
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '100vh', background: 'var(--awriq-bg)' }}>
-        <div style={{ textAlign: 'center' }}>
-          <div style={{ fontSize: '48px', fontWeight: 800, color: '#8A5A2B', marginBottom: '12px' }}>AWRIQ</div>
-          <div style={{ fontSize: '14px', color: '#68727A' }}>جاري التحميل...</div>
-        </div>
+function FullScreenLoader() {
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '100vh', background: 'var(--awriq-bg)' }}>
+      <div style={{ textAlign: 'center' }}>
+        <div style={{ fontSize: '48px', fontWeight: 800, color: '#8A5A2B', marginBottom: '12px' }}>AWRIQ</div>
+        <div style={{ fontSize: '14px', color: '#68727A' }}>جاري التحميل...</div>
       </div>
-    )
-  }
+    </div>
+  )
+}
 
-  if (!session) {
-    return <Navigate to="/login" replace />
-  }
+function FullScreenError({ message }: { message: string }) {
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '100vh', background: 'var(--awriq-bg)' }}>
+      <div style={{ textAlign: 'center', maxWidth: '400px', padding: '32px' }}>
+        <div style={{ fontSize: '48px', fontWeight: 800, color: '#C94B4B', marginBottom: '12px' }}>AWRIQ</div>
+        <div style={{ fontSize: '15px', color: '#68727A', lineHeight: 1.6 }}>{message}</div>
+      </div>
+    </div>
+  )
+}
+
+function ProtectedRoutes() {
+  const { session, loading, authError } = useAuth()
+
+  if (loading) return <FullScreenLoader />
+
+  if (authError) return <FullScreenError message={authError} />
+
+  if (!session) return <Navigate to="/login" replace />
 
   return (
     <Routes>
