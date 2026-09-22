@@ -1,0 +1,7 @@
+project_id = "awriq"
+
+[functions.connection-test]
+verify_jwt = false
+
+[functions.heartbeat]
+verify_jwt = false
