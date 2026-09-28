@@ -35,8 +35,8 @@ async function decryptPax(namespace: string, value: string | null | undefined): 
   const parts = value.split(":");
   if (parts.length < 4) return null;
   try {
-    const key = await crypto.subtle.importKey("raw", await paxKey(namespace), "AES-GCM", false, ["decrypt"]);
-    const buf = await crypto.subtle.decrypt({ name: "AES-GCM", iv: b64uDecode(parts[2]) }, key, b64uDecode(parts[3]));
+    const key = await crypto.subtle.importKey("raw", (await paxKey(namespace)) as unknown as ArrayBuffer, "AES-GCM", false, ["decrypt"]);
+    const buf = await crypto.subtle.decrypt({ name: "AES-GCM", iv: b64uDecode(parts[2]) as unknown as ArrayBuffer }, key, b64uDecode(parts[3]) as unknown as ArrayBuffer);
     return new TextDecoder().decode(buf);
   } catch { return null; }
 }
@@ -72,37 +72,99 @@ async function authUser(req: Request): Promise<{ id: string; roles: string[]; pr
   if (error || !u?.user) return null;
   const roles: string[] = [];
   const { data: rr } = await supabase.from("user_roles").select("roles(name)").eq("user_id", u.user.id);
-  for (const r of rr ?? []) if (r?.roles?.name) roles.push(r.roles.name);
+  for (const r of (rr ?? []) as any[]) if (r?.roles?.name) roles.push(String(r.roles.name));
   const projectIds: string[] = [];
   const { data: pm } = await supabase.from("project_members").select("project_id").eq("user_id", u.user.id).eq("role", "owner");
   for (const p of pm ?? []) if (p?.project_id) projectIds.push(p.project_id);
   return { id: u.user.id, roles, projectIds };
 }
 
+// ---------- موجه المهام (Tool Router) ----------
+type TaskId = "db" | "code" | "git" | "deploy" | "repo";
+
+const TASK: Record<TaskId, { strategy: string; tools: string[]; budget: number }> = {
+  db: {
+    strategy: "خطة بيانات (DB-first): كل مدارس/مؤسسات/جلسات/سجلات = جداول قاعدة بيانات AWRIQ. استخدم db_select مباشرة؛ لا تمسح ملفات ولا تبحث في مستودعات عن بيانات. إن وجدت ثم طُلبت بيانات أخرى (جلسات/طلاب) فاسألها من DB. لأمر حذف: db_select للبحث ثم db_delete وتوقف لموافقة.",
+    tools: ["db_select", "db_delete"],
+    budget: 6,
+  },
+  code: {
+    strategy: "خطة كود: حدد الملفات المستهدفة أولاً (search_files داخل مجلد محدد أو read_file لمسار معروف)، ثم عدّل بـ edit_file. لا تسرد جذور المشاريع ولا تمسح كل الملفات. تحقق read_file بعد أي تعديل، وrun_command (نحو build/test) للتحقق.",
+    tools: ["list_files", "read_file", "search_files", "edit_file", "git_status", "git_diff", "run_command"],
+    budget: 14,
+  },
+  git: {
+    strategy: "خطة Git: اقرأ الحالة/الفرق والأدوات المباشرة. لا تعدّل ملفات إلا أن تطلب المهمة.",
+    tools: ["git_status", "git_diff", "read_file", "list_files"],
+    budget: 5,
+  },
+  deploy: {
+    strategy: "خطة نشر: تحقق من آخر النشرات ثم أبلغ الحالة. لا تنشر ما لم تطلب المهمة صراحةً.",
+    tools: ["vercel_list", "git_status", "read_file", "list_files"],
+    budget: 5,
+  },
+  repo: {
+    strategy: "خطة تصفّح: استخدم list_files لمجلد محدد و read_file/search_files للوصول الدقيق. لا تمسح جذر المشروع أو كل الملفات.",
+    tools: ["list_files", "read_file", "search_files", "git_status"],
+    budget: 8,
+  },
+};
+
+function classifyMessage(msg: string): TaskId {
+  const t = msg ?? "";
+  const db = ["مدرس", "مدارس", "مؤسسة", "مؤسسات", "طالب", "طلاب", "جلسة", "جلسات", "معلم", "سجل", "بيانات", "حذف", "احذف", "إضافة", "عرض", "كم عدد", "تعريف", "أسماء"].filter((k) => t.includes(k)).length;
+  const code = ["login", "إصلاح", "مشكلة", "خطأ", "bug", "ميزة", "feature", "كود", "دالة", "تعمل", "فحص", "بحث عن", "لماذا"].filter((k) => t.includes(k)).length;
+  const git = ["status", "commit", "التزام", "فرع", "push", "diff", "تاريخ"].filter((k) => t.includes(k)).length;
+  const dep = ["نشر", "deploy", "vercel", "إطلاق", "back to live", "production"].filter((k) => t.toLowerCase().includes(k)).length;
+  const scores: Array<[TaskId, number]> = [["db", db], ["code", code], ["git", git], ["deploy", dep]];
+  const top = scores.sort((a, b) => b[1] - a[1])[0];
+  return top[1] > 0 ? top[0] : "repo";
+}
+
+// ---------- ملف جانبي للمخطط (Schema Profile) مع كاش ----------
+const PROF_SCHEMA = "v1";
+async function getProjectProfile(projectId: string): Promise<any> {
+  const { data: proj } = await supabase.from("projects").select("agent_profile").eq("id", projectId).maybeSingle();
+  const cached = proj?.agent_profile as any;
+  if (cached?.schema === PROF_SCHEMA && cached?.builtAt && Date.now() - new Date(cached.builtAt).getTime() < 3600_000) return cached;
+  const count = async (t: string) => (await supabase.from(t).select("id", { count: "exact", head: true })).count ?? 0;
+  const [institutions, sessions, admins, activeSessions] = await Promise.all([
+    count("institutions"),
+    count("sessions"),
+    count("institution_admins"),
+    (await supabase.from("sessions").select("id", { count: "exact", head: true }).eq("status", "active")).count ?? 0,
+  ]);
+  const profile = { schema: PROF_SCHEMA, builtAt: new Date().toISOString(), data: { institutions, sessions, institution_admins: admins, active_sessions: activeSessions } };
+  await supabase.from("projects").update({ agent_profile: profile }).eq("id", projectId).then(() => {}, () => {});
+  return profile;
+}
+
 // ---------- context ----------
-function buildSystem(project: any, mode: string, repo: { owner: string; repo: string; branch: string } | null): string {
-  return `أنت AWRIQ Coding Agent. تعمل فقط على المشروع المحدد في هذه الجلسة.
+function buildSystem(project: any, mode: string, repo: { owner: string; repo: string; branch: string } | null, task: TaskId, profile: any): string {
+  const t = TASK[task];
+  const profileInfo = profile?.data
+    ? `ملف جانب واحد لـ AWRIQ (الأرقام من DB): مدارس (institutions): ${profile.data.institutions}، جلسات (sessions): ${profile.data.sessions} (نشطة ${profile.data.active_sessions})، أمناء مؤسسات: ${profile.data.institution_admins}.`
+    : "";
+  return `أنت AWRIQ Agent. تعمل فقط على المشروع المحدد في هذه الجلسة.
 أهدافك الصارمة:
-- لا تدّعِ تنفيذ أي عملية لم تنفذها فعليًا.
-- للتنفيذ استخدم الأدوات؛ لا تكتب "سأشغّل الأمر" كنص، بل استدعِ الأداة.
-- بعد تعديل ملف، تحقق (read_file) من التعديل.
-- بعد إصلاح مشكلة، شغّل الأداة الممكنة (run_command build/test) للتحقق. إذا فشلت لا تقل إنها انتهت؛ وضح الفشل واصلحه.
-- إذا Exit Code غير 0 فالأمر فشل؛ لا تحوله إلى نجاح.
-- العمليات الحساسة (تعديل ملفات/دُفع) في وضع الموافقة: استدعِ edit_file بـ apply=ask وتوقف حتى تأتي الموافقة.
-- لا تصل إلى مشروع غير هذا.
-- لا تكشف أسرارًا (توكنات/مفاتيح/بيانات حساسة) في ردودك.
-- السرية: المفاتيح داخل الخادم لا تراها أنت ولا الواجهة.
+- لا تدّعِ تنفيذ أي عملية لم تنفذها فعليًا. أبلغ النتائج كما هي (أو فشلها) بصدق.
+- للتنفيذ استخدم الأدوات؛ لا تكتب "سأشغّل" كنص.
+- البيانات (مدرسة/مؤسسة/جلسة/طالب/سجل) = جداول قاعدة البيانات. مؤسسات = "المدارس". استخدم db_select دائمًا للبيانات، ولا تبحث عن بيانات في المستودعات أبدًا.
+- حذف سجل = db_delete (يطلب موافقة)؛ أي حذف فعلي ينتظر الموافقة.
+- بعد تعديل ملف تحقق (read_file). بعد فشل أمر build/test لا تقل إنها انتهت؛ وضح الفشل واصلحه.
+- العمليات الحساسة (تعديل/حذف) في وضع الموافقة: استدعِ الأداة بـ apply=ask وتوقف حتى موافقة.
+- لا تصل إلى مشروع آخر. لا تكشف أسرارًا (توكنات/مفاتيح) في ردودك.
+- عندما تنتهي المهمة بأي نتيجة (نجاح أو فشل) أبلغها بإيجاز ولا تحتفظ بخطوات زائدة.
 
 سياق المشروع:
 - اسم المشروع: ${project?.name ?? "غير محدد"}
-- رقم المشروع: ${project?.project_type ?? "؟"}
 - المستودع: ${repo ? `${repo.owner}/${repo.repo}` : "غير مربوط"} (الفرع: ${repo?.branch ?? "؟"})
 - وضع الأدوات: ${mode === "read" ? "قراءة فقط" : mode === "plan" ? "قراءة + تخطيط (لا تعديل)" : "تعديل بموافقة"}
+${profileInfo}
+مهمتك المحددة تصنيفها: «${task}» — ${t.strategy}
+أدواتك المسموحة فقط: ${t.tools.join(", ")} (ميزانية الأدوات: ${t.budget}).
 
-الأدوات المتاحة: list_files, read_file, search_files, edit_file, git_status, git_diff, run_command, supabase_select, vercel_list.
-الأدوات الحساسة: edit_file (يتطلب موافقة في وضع edit_approval)، run_command (تنفيذ حقيقي عبر GitHub Actions فقط).
-
-إذا لم يستطع النظام تنفيذ أداة (مثلًا لا credential)، انقل ذلك كما هو وقرر خطوة تالية آمنة. لا تخترع نتيجة.`;
+إذا لم يُنفَّذ شيء (لا credential/خطأ أداة) انقل الخطأ كما ورد من النظام. لا تخترع نتيجة.`;
 }
 
 // ---------- agent loop ----------
@@ -130,6 +192,28 @@ async function approveAndApply(ctx: AgentToolCtx, approvalId: string): Promise<s
   const { data } = await ctx.supabase.from("agent_approvals").select("payload, project_id").eq("id", approvalId).maybeSingle();
   if (!data?.payload) return "طلب الموافقة غير معثور عليه.";
   const act: any = data.payload;
+
+  if (act.action === "db_delete") {
+    const table = String(act.table ?? "");
+    const id = String(act.id ?? "");
+    if (!["institutions", "sessions", "institution_admins"].includes(table) || !id) return "طلب حذف غير صالح (جدول/معرف).";
+    const { data: deleted, error } = await ctx.supabase.from(table).delete().eq("id", id).select("*");
+    if (error || !deleted?.length) {
+      const { data: gone } = await ctx.supabase.from(table).select("id").eq("id", id).maybeSingle();
+      if (!gone) {
+        await ctx.supabase.from("agent_approvals").update({ status: "approved", reviewed_at: new Date().toISOString(), reviewed_by: ctx.requestUserId }).eq("id", approvalId);
+        return `السجل (id ${id}) لم يعد موجودًا في ${table} (محذوف مسبقًا). اعتُبر المعتمَد مُنفَّذًا.`;
+      }
+      return `فشل الحذف الفعلي من ${table} (id ${id}): ${error?.message ?? "لا خبر"} — لم يُحذف شيء.`;
+    }
+    const label = String(act.label ?? deleted[0]?.name_ar ?? deleted[0]?.name ?? id);
+    const { data: still } = await ctx.supabase.from(table).select("id").eq("id", id).maybeSingle();
+    await ctx.supabase.from("agent_approvals").update({ status: "approved", reviewed_at: new Date().toISOString(), reviewed_by: ctx.requestUserId }).eq("id", approvalId);
+    return still
+      ? `حُذف ${deleted.length} صف؟ التحقق يشير إلى أنه ما زال موجودًا — فحصّ يدويًا.`
+      : `نُفِّذ الحذف المعتمَد فعليًا: «${label}» من ${table} (id ${id}) وحُذفت. الموافقة ${approvalId.slice(0, 8)}.`;
+  }
+
   const from = String(act.path ?? "").split("/");
   const enc = from.map(encodeURIComponent).join("/");
   let sha: string | null = null;
@@ -197,7 +281,26 @@ async function runOnce(body: RunRequest, user: { id: string; roles: string[]; pr
         mode,
         projectId: String(project.id),
         requestUserId: user.id,
+        cache: { tree: null },
       };
+
+      // موجه المهام + ميزانيات + الملف الجانبي
+      let task: TaskId;
+      if (body.approve_approval_id) {
+        const { data: ap } = await supabase.from("agent_approvals").select("payload, action_type").eq("id", String(body.approve_approval_id)).maybeSingle();
+        const aaction = (ap?.payload as any)?.action ?? ap?.action_type;
+        task = aaction === "db_delete" ? "db" : ap?.action_type === "file_modify" ? "code" : "repo";
+      } else {
+        task = classifyMessage(body.message ?? "");
+      }
+      const tmeta = TASK[task];
+      const allowedTools = new Set(tmeta.tools);
+      const allowedDefs = TOOL_DEFS.filter((d: any) => allowedTools.has(d.function.name));
+      const toolCap = tmeta.budget;
+      const runId = crypto.randomUUID();
+      const deadline = started + 170_000;
+      const profile = await getProjectProfile(String(project.id));
+      await sse.emit("run.start", { runId, task, tools: tmeta.tools, maxSteps, toolCap, deadlineMs: deadline - started, strategy: tmeta.strategy });
 
       // provider chain: DeepSeek أولاً (env) ثم سلسلة الخزنة
       const chain: Array<{ label: string; stream: (msgs: ChatMessage[]) => Promise<ProviderStep> }> = [];
@@ -205,7 +308,7 @@ async function runOnce(body: RunRequest, user: { id: string; roles: string[]; pr
         const ds = new DeepSeekProvider(DEEPSEEK_KEY, DEEPSEEK_MODEL);
         chain.push({
           label: ds.label,
-          stream: (msgs) => ds.stream(msgs, { tools: TOOL_DEFS as any, maxTokens: 4096 }),
+          stream: (msgs) => ds.stream(msgs, { tools: allowedDefs as any, maxTokens: 4096 }),
         });
       }
       const { data: provRows } = await supabase.from("ai_providers").select("id, code, name, base_url, config").eq("is_enabled", true).order("priority", { ascending: true });
@@ -215,14 +318,14 @@ async function runOnce(body: RunRequest, user: { id: string; roles: string[]; pr
         const { data: sec } = await supabase.from("ai_provider_secrets").select("encrypted_secret").eq("provider_id", p.id).is("project_id", null).limit(1);
         const apiKey = sec?.[0] ? await decryptPax(String(p.id), sec[0].encrypted_secret) : null;
         if (!apiKey) continue;
-        const model = p.code === "gemini" ? "gemini-2.5-flash" : p.code === "pollinations" ? null : null;
+        const model = p.code === "gemini" ? "gemini-2.5-flash" : null;
         if (!model) continue;
         const prov = new OpenAICompatProvider({ base: p.base_url, apiKey, model, label: p.name ?? p.code });
-        chain.push({ label: prov.label, stream: (msgs) => prov.stream(msgs, { tools: TOOL_DEFS as any, maxTokens: 4096 }) });
+        chain.push({ label: prov.label, stream: (msgs) => prov.stream(msgs, { tools: allowedDefs as any, maxTokens: 4096 }) });
       }
 
       // نظام prompt + رسائل
-      const system = buildSystem(project, mode, repo);
+      const system = buildSystem(project, mode, repo, task, profile);
       const history = (body.history ?? []).slice(-40).map((h) => ({ ...h }));
       const messages: ChatMessage[] = [{ role: "system", content: system }, ...history];
       if (body.approve_approval_id) {
@@ -240,8 +343,19 @@ async function runOnce(body: RunRequest, user: { id: string; roles: string[]; pr
       let status: string = "success";
       let lastError: string | null = null;
       let waitingApproval = false;
+      let toolCalls = 0;
+      let resolvedLabel: string | undefined;
 
       for (let step = 0; step < maxSteps; step++) {
+        const elapsed = Date.now() - started;
+        if (toolCalls >= toolCap || elapsed >= deadline) {
+          status = "success";
+          const why = toolCalls >= toolCap ? "بلغت ميزانية الأدوات المخصصة" : "اقتربت مهمتك من حد مدة التنفيذ (الخادم سيغلق)";
+          finalText = `أوقفت التنفيذ (${why}) بعد ${toolCalls} استدعاء أداة — نُجزت جزئيًا: ${actions.filter((a) => a.ok).length}/${actions.length} ناجح. إن احتاج الأمر خطوات أكثر فقسم المهمة.`;
+          await sse.emit("agent.completed", { provider: resolvedLabel ?? "AWRIQ", text: finalText, usage: totalUsage, costEst: estimateCost(totalUsage), durationMs: Date.now() - started, truncated: true, because: why });
+          break;
+        }
+
         let resolved: { label: string; step: ProviderStep } | null = null;
         let chainErr: { kind: string; msg: string } | null = null;
         for (const p of chain) {
@@ -260,43 +374,51 @@ async function runOnce(body: RunRequest, user: { id: string; roles: string[]; pr
           await sse.emit("agent.error", { message: chainErr?.msg ?? "DeepSeek request failed.", kind: chainErr?.kind ?? "unknown" });
           return;
         }
-        const { label, step } = resolved;
-        if (step.usage) { totalUsage.prompt_tokens += step.usage.prompt_tokens; totalUsage.completion_tokens += step.usage.completion_tokens; totalUsage.total_tokens += step.usage.total_tokens; }
-        if (step.text) await sse.emit("assistant.delta", { text: step.text });
+        const { label, step: providerStep } = resolved;
+        resolvedLabel = label;
+        if (providerStep.usage) { totalUsage.prompt_tokens += providerStep.usage.prompt_tokens; totalUsage.completion_tokens += providerStep.usage.completion_tokens; totalUsage.total_tokens += providerStep.usage.total_tokens; }
+        if (providerStep.text) await sse.emit("assistant.delta", { text: providerStep.text });
 
-        if (step.toolCalls.length === 0) {
-          finalText = step.text;
+        if (providerStep.toolCalls.length === 0) {
+          finalText = providerStep.text;
           await sse.emit("agent.completed", { provider: label, text: finalText, usage: totalUsage, costEst: estimateCost(totalUsage), durationMs: Date.now() - started });
           break;
         }
 
-        for (const tc of step.toolCalls) {
-          await sse.emit("tool.start", { id: tc.id, name: tc.name, args: safeArgs(tc.arguments) });
-          const result = await runTool(tc.name, tc.arguments, ctx);
+        for (const tc of providerStep.toolCalls) {
+          let result: import("./tools.ts").ToolResult;
+          const notAllowed = !allowedTools.has(tc.name);
+          if (notAllowed) {
+            result = { ok: false, output: `أداة «${tc.name}» خارج نطاق مهمة «${task}» (المسموح: ${tmeta.tools.join(", ")}) — التزم بخطة المهمة.`, events: [], errorType: "invalid" };
+          } else {
+            toolCalls++;
+            await sse.emit("tool.start", { id: tc.id, name: tc.name, args: safeArgs(tc.arguments) });
+            result = await runTool(tc.name, tc.arguments, ctx);
+          }
           for (const ev of result.events) {
             if (ev.fileChanged) { filesChanged.push(ev.fileChanged.path); await sse.emit("file.changed", ev.fileChanged); }
             if (ev.approvalRequired) { waitingApproval = true; await sse.emit("approval.required", ev.approvalRequired); }
             if (ev.commandDispatched) { commands.push(String(ev.commandDispatched.workflow)); await sse.emit("command.dispatched", ev.commandDispatched); }
           }
-          await sse.emit("tool.completed", { id: tc.id, name: tc.name, ok: result.ok, output: unsafePreview(result.output) });
-          actions.push({ tool: tc.name, ok: result.ok });
+          await sse.emit("tool.completed", { id: tc.id, name: tc.name, ok: result.ok, output: unsafePreview(result.output), errorType: result.errorType, statusCode: result.statusCode ?? null, durationMs: result.durationMs ?? null, retried: result.retried ?? false });
+          actions.push({ tool: tc.name, ok: result.ok, errorType: result.errorType ?? null });
           const assistantMsg: ChatMessage = {
             role: "assistant",
             content: null,
             tool_calls: [{ id: tc.id, type: "function", function: { name: tc.name, arguments: tc.arguments } }],
           };
           // DeepSeek thinking-mode contract: reasoning_content يجب أن يُعاد للإرسال. (دونه: HTTP 400)
-          if (step.reasoning) (assistantMsg as any).reasoning_content = step.reasoning;
+          if (providerStep.reasoning) (assistantMsg as any).reasoning_content = providerStep.reasoning;
           messages.push(assistantMsg);
           messages.push({ role: "tool", tool_call_id: tc.id, name: tc.name, content: result.output.slice(0, 20000) });
         }
 
-        if (waitingApproval) { status = "approval_pending"; finalText = "انتظار موافقة المستخدم على التعديل المقترح."; await sse.emit("agent.completed", { provider: label, text: finalText, usage: totalUsage, costEst: estimateCost(totalUsage), durationMs: Date.now() - started, waitingApproval: true }); break; }
+        if (waitingApproval) { status = "approval_pending"; finalText = "انتظار موافقة المستخدم."; await sse.emit("agent.completed", { provider: label, text: finalText, usage: totalUsage, costEst: estimateCost(totalUsage), durationMs: Date.now() - started, waitingApproval: true }); break; }
 
         if (step === maxSteps - 1) {
           status = "success";
-          finalText = "بلغ العميل حد الخطوات القصوى قبل الإنهاء.";
-          await sse.emit("agent.completed", { provider: label, text: finalText, usage: totalUsage, costEst: estimateCost(totalUsage), durationMs: Date.now() - started, truncated: true });
+          finalText = "بلغت حد الخطوات قبل الإنهاء (قسم المهمة أو اطلب استمرارًا).";
+          await sse.emit("agent.completed", { provider: label, text: finalText, usage: totalUsage, costEst: estimateCost(totalUsage), durationMs: Date.now() - started, truncated: true, because: "max_steps" });
         }
       }
 
@@ -311,7 +433,7 @@ async function runOnce(body: RunRequest, user: { id: string; roles: string[]; pr
         tests_run: commands.some((c) => /test/i.test(c)),
         result: finalText || null,
         error: lastError,
-        usage_info: { tokens: totalUsage, cost_est: estimateCost(totalUsage), started_at: logStarted, duration_ms: Date.now() - started },
+        usage_info: { tokens: totalUsage, cost_est: estimateCost(totalUsage), started_at: logStarted, duration_ms: Date.now() - started, task },
       }).then(() => {}, () => {});
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

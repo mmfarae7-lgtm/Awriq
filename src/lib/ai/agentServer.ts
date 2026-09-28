@@ -159,6 +159,10 @@ export async function runServerAgent(opts: {
       }
     }
   }
+  if (!result.error && !result.text) {
+    result.error = 'انقطع البث قبل إكمال المهمة (مهلة الخادم أو إغلاق القناة). وحّد السؤال أو أعد تشغيل الغرفة ثم أعد المحاولة.'
+    opts.onEvent.onError?.(result.error, 'timeout')
+  }
   return result
 }
 
