@@ -107,6 +107,27 @@ ALTER TABLE user_profiles ENABLE ROW LEVEL SECURITY;
 ALTER TABLE user_roles ENABLE ROW LEVEL SECURITY;
 
 -- ============================================
+-- ROLE CHECK HELPER (SECURITY DEFINER)
+-- Prevents infinite RLS recursion: policy bodies reference this
+-- function instead of querying user_roles / roles directly.
+-- ============================================
+CREATE OR REPLACE FUNCTION public.user_has_role(role_names text[])
+RETURNS boolean
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public, auth
+AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM public.user_roles ur
+    JOIN public.roles r ON r.id = ur.role_id
+    WHERE ur.user_id = auth.uid() AND r.name = ANY(role_names)
+  );
+$$;
+
+GRANT EXECUTE ON FUNCTION public.user_has_role(text[]) TO authenticated;
+
+-- ============================================
 -- POLICIES: roles
 -- ============================================
 DROP POLICY IF EXISTS "roles_select_authenticated" ON roles;
@@ -116,20 +137,8 @@ CREATE POLICY "roles_select_authenticated" ON roles FOR SELECT
 DROP POLICY IF EXISTS "roles_manage_super_admin" ON roles;
 CREATE POLICY "roles_manage_super_admin" ON roles FOR ALL
   TO authenticated
-  USING (
-    EXISTS (
-      SELECT 1 FROM user_roles ur
-      JOIN roles r ON r.id = ur.role_id
-      WHERE ur.user_id = auth.uid() AND r.name = 'super_admin'
-    )
-  )
-  WITH CHECK (
-    EXISTS (
-      SELECT 1 FROM user_roles ur
-      JOIN roles r ON r.id = ur.role_id
-      WHERE ur.user_id = auth.uid() AND r.name = 'super_admin'
-    )
-  );
+  USING (public.user_has_role(ARRAY['super_admin']))
+  WITH CHECK (public.user_has_role(ARRAY['super_admin']));
 
 -- ============================================
 -- POLICIES: permissions
@@ -237,31 +246,13 @@ CREATE POLICY "user_roles_select_own" ON user_roles FOR SELECT
 DROP POLICY IF EXISTS "user_roles_select_admin" ON user_roles;
 CREATE POLICY "user_roles_select_admin" ON user_roles FOR SELECT
   TO authenticated
-  USING (
-    EXISTS (
-      SELECT 1 FROM user_roles ur
-      JOIN roles r ON r.id = ur.role_id
-      WHERE ur.user_id = auth.uid() AND r.name IN ('super_admin', 'central_admin')
-    )
-  );
+  USING (public.user_has_role(ARRAY['super_admin', 'central_admin']));
 
 DROP POLICY IF EXISTS "user_roles_manage_super_admin" ON user_roles;
 CREATE POLICY "user_roles_manage_super_admin" ON user_roles FOR ALL
   TO authenticated
-  USING (
-    EXISTS (
-      SELECT 1 FROM user_roles ur
-      JOIN roles r ON r.id = ur.role_id
-      WHERE ur.user_id = auth.uid() AND r.name = 'super_admin'
-    )
-  )
-  WITH CHECK (
-    EXISTS (
-      SELECT 1 FROM user_roles ur
-      JOIN roles r ON r.id = ur.role_id
-      WHERE ur.user_id = auth.uid() AND r.name = 'super_admin'
-    )
-  );
+  USING (public.user_has_role(ARRAY['super_admin']))
+  WITH CHECK (public.user_has_role(ARRAY['super_admin']));
 
 -- ============================================
 -- UPDATED_AT TRIGGER FUNCTION

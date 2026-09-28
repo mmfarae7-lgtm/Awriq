@@ -16,11 +16,20 @@ export function formatRelativeTime(dateString: string | null): string {
   return date.toLocaleDateString('ar-EG', { year: 'numeric', month: 'long', day: 'numeric' })
 }
 
-export function getConnectionStatusInfo(status: ConnectionStatus): {
-  label: string
-  color: string
-  dotColor: string
-} {
+/** Compact future countdown for approval expiry (HH:MM:SS or "منتهية"). */
+export function formatCountdown(untilIso: string | null): string {
+  if (!untilIso) return '…'
+  const diffMs = new Date(untilIso).getTime() - Date.now()
+  if (diffMs <= 0) return 'منتهية'
+  const s = Math.floor(diffMs / 1000)
+  const h = Math.floor(s / 3600)
+  const m = Math.floor((s % 3600) / 60)
+  const sec = s % 60
+  if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`
+  return `${m}:${String(sec).padStart(2, '0')} د`
+}
+
+export function getConnectionStatusInfo(status: ConnectionStatus): { label: string; color: string; dotColor: string } {
   switch (status) {
     case 'connected':
       return { label: 'متصل', color: '#4F8A5B', dotColor: '#4F8A5B' }

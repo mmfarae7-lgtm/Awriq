@@ -243,6 +243,9 @@ body {
   .sidebar-desktop {
     transform: translateX(100%) !important;
   }
+  .sidebar-desktop.sidebar-open {
+    transform: translateX(0) !important;
+  }
   .menu-toggle {
     display: flex !important;
   }
@@ -266,6 +269,21 @@ body {
     grid-template-columns: 1fr !important;
   }
   .agent-sidebar-left, .agent-sidebar-right {
+    display: none !important;
+  }
+  .app-header {
+    padding: 0 12px !important;
+    gap: 8px !important;
+  }
+  .app-header-search {
+    max-width: none !important;
+    flex: 1 1 120px !important;
+    min-width: 0 !important;
+  }
+  .app-header-user-details {
+    display: none !important;
+  }
+  .app-header-fullscreen {
     display: none !important;
   }
 }

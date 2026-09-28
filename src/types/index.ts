@@ -11,23 +11,35 @@ export type AgentMode = 'read_only' | 'analyze' | 'fix_with_approval' | 'full_de
 export type AgentSessionStatus = 'idle' | 'connecting' | 'analyzing' | 'working' | 'testing' | 'waiting_approval' | 'deploying' | 'completed' | 'failed' | 'stopped'
 export type AgentTaskStatus = 'pending' | 'analyzing' | 'running' | 'waiting_approval' | 'completed' | 'failed' | 'cancelled'
 export type TokenStatus = 'active' | 'revoked' | 'expired' | 'rotated'
+export type TokenProfile = 'READ_ONLY' | 'DEVELOPER' | 'FULL_AGENT'
 export type ProjectEnvironment = 'development' | 'staging' | 'production'
-export type ApprovalStatus = 'pending' | 'approved' | 'rejected' | 'expired'
+export type ApprovalStatus = 'pending' | 'approved' | 'rejected' | 'denied' | 'expired'
 export type DeploymentStatus = 'pending' | 'deploying' | 'successful' | 'failed' | 'rolled_back'
 export type SecurityEventSeverity = 'low' | 'medium' | 'high' | 'critical'
 
 export interface Project {
   id: string
-  institution_id: string
+  institution_id: string | null
   name: string
+  slug: string
+  status: string
+  repository_type: string
   description: string | null
   repository_url: string | null
   environment: ProjectEnvironment
+  project_type: 'institution' | 'other' | 'program' | 'software'
+  github_repo: string | null
+  github_branch: string
+  vercel_project: string | null
+  supabase_project: string | null
+  local_path: string | null
   root_path: string
   agent_status: 'connected' | 'disconnected' | 'connecting' | 'error'
   last_agent_connection_at: string | null
   last_agent_run_at: string | null
   last_deployment_at: string | null
+  last_agent_session_at: string | null
+  last_activity_at: string | null
   build_status: string | null
   test_status: string | null
   health_status: string | null
@@ -39,11 +51,13 @@ export interface Project {
 export interface AccessToken {
   id: string
   project_id: string
-  institution_id: string
+  institution_id: string | null
   name: string
   token_hash: string
   token_prefix: string
   scopes: string[]
+  permissions: string[] | null
+  profile: TokenProfile
   environment: string
   status: TokenStatus
   created_by: string | null
@@ -57,15 +71,32 @@ export interface AccessToken {
 
 export interface AgentSession {
   id: string
-  user_id: string
-  institution_id: string
+  user_id: string | null
+  institution_id: string | null
   project_id: string
   token_id: string | null
   mode: AgentMode
   status: AgentSessionStatus
+  lifecycle: 'active' | 'expired' | 'revoked' | 'closed'
+  agent_client: string | null
+  last_activity_at: string | null
   permissions: Record<string, unknown>
   started_at: string
   ended_at: string | null
+  created_at: string
+}
+
+export interface ProjectSnapshot {
+  id: string
+  project_id: string
+  session_id: string | null
+  snapshot_id: string
+  label: string
+  branch: string | null
+  commit_sha: string | null
+  status: 'created' | 'restored' | 'failed'
+  metadata: Record<string, unknown>
+  created_by: string | null
   created_at: string
 }
 
@@ -116,6 +147,7 @@ export interface AgentApproval {
   status: ApprovalStatus
   reviewed_by: string | null
   reviewed_at: string | null
+  expires_at: string | null
   created_at: string
 }
 

@@ -1,5 +1,5 @@
 import { NavLink, useNavigate } from 'react-router-dom'
-import { Feather, Home, Building2, Users, Cable, BarChart3, Bell, History, Settings, LifeBuoy, LogOut, X, Bot, FolderGit2, Shield } from 'lucide-react'
+import { Feather, Home, Settings, LogOut, X, Bot, FolderGit2, LayoutGrid } from 'lucide-react'
 import { useAuth } from '../../lib/auth'
 import { useToast } from '../../lib/toast'
 
@@ -8,20 +8,27 @@ interface SidebarProps {
   onClose: () => void
 }
 
-const menuItems = [
+interface SidebarGroup {
+  path?: string
+  label: string
+  icon?: typeof Home
+  children?: { path: string; label: string }[]
+}
+
+const nav: SidebarGroup[] = [
   { path: '/', label: 'الرئيسية', icon: Home },
-  { path: '/institutions', label: 'المدارس والمعاهد', icon: Building2 },
-  { path: '/users', label: 'المستخدمون', icon: Users },
-  { path: '/connections', label: 'الربط والأنظمة', icon: Cable },
-  { path: '/agent-room', label: 'غرفة الوكيل البرمجي', icon: Bot },
-  { path: '/projects', label: 'المشاريع', icon: FolderGit2 },
-  { path: '/reports', label: 'التقارير', icon: BarChart3 },
-  { path: '/notifications', label: 'الإشعارات', icon: Bell },
-  { path: '/activity', label: 'سجل النشاط', icon: History },
-  { path: '/security', label: 'الأمان', icon: Shield },
-  { path: '/access-tokens', label: 'Access Tokens', icon: Cable },
+  {
+    path: '/projects',
+    label: 'المشاريع',
+    icon: FolderGit2,
+    children: [
+      { path: '/institutions', label: 'المدارس والمعاهد' },
+      { path: '/projects?cat=other', label: 'مشاريع أخرى' },
+      { path: '/projects?cat=programs', label: 'البرامج' },
+    ],
+  },
+  { path: '/agent-room', label: 'غرفة الوكيل', icon: Bot },
   { path: '/settings', label: 'الإعدادات', icon: Settings },
-  { path: '/support', label: 'الدعم الفني', icon: LifeBuoy },
 ]
 
 export default function Sidebar({ isOpen, onClose }: SidebarProps) {
@@ -63,7 +70,7 @@ export default function Sidebar({ isOpen, onClose }: SidebarProps) {
           transform: isOpen ? 'translateX(0)' : 'translateX(100%)',
           transition: 'transform 0.3s ease',
         }}
-        className="sidebar-desktop"
+        className={`sidebar-desktop${isOpen ? ' sidebar-open' : ''}`}
       >
         {/* Logo section */}
         <div style={{ padding: '24px 20px', borderBottom: '1px solid rgba(200,155,90,0.1)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
@@ -96,33 +103,63 @@ export default function Sidebar({ isOpen, onClose }: SidebarProps) {
 
         {/* Navigation */}
         <nav style={{ flex: 1, padding: '16px 12px', overflowY: 'auto' }}>
-          {menuItems.map((item) => {
-            const Icon = item.icon
-            return (
-              <NavLink
-                key={item.path}
-                to={item.path}
-                end={item.path === '/'}
-                style={({ isActive }) => ({
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '12px',
-                  padding: '10px 14px',
-                  borderRadius: '8px',
-                  fontSize: '14px',
-                  fontWeight: isActive ? 600 : 500,
-                  color: isActive ? '#C89B5A' : '#8A95A0',
-                  textDecoration: 'none',
-                  marginBottom: '4px',
-                  background: isActive ? 'rgba(200,155,90,0.1)' : 'transparent',
-                  transition: 'all 0.2s',
-                  borderRight: isActive ? '3px solid #C89B5A' : '3px solid transparent',
-                })}
-              >
-                <Icon size={18} />
-                <span>{item.label}</span>
-              </NavLink>
+          {nav.map((group) => {
+            const GroupIcon = group.icon
+            const content = (
+              <div style={{ marginBottom: group.children ? '12px' : '4px' }}>
+                <NavLink
+                  to={group.path ?? '/projects'}
+                  end={group.path === '/'}
+                  style={({ isActive }) => ({
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '12px',
+                    padding: '10px 14px',
+                    borderRadius: '8px',
+                    fontSize: '14px',
+                    fontWeight: isActive ? 700 : 600,
+                    color: isActive ? '#C89B5A' : '#8A95A0',
+                    textDecoration: 'none',
+                    marginBottom: '4px',
+                    background: isActive ? 'rgba(200,155,90,0.1)' : 'transparent',
+                    transition: 'all 0.2s',
+                    borderRight: isActive ? '3px solid #C89B5A' : '3px solid transparent',
+                  })}
+                >
+                  {GroupIcon && <GroupIcon size={18} />}
+                  <span>{group.label}</span>
+                </NavLink>
+                {group.children && (
+                  <div style={{ padding: '2px 10px 2px 0' }}>
+                    {group.children.map((child) => (
+                      <NavLink
+                        key={child.path}
+                        to={child.path}
+                        style={({ isActive }) => ({
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: '10px',
+                          padding: '8px 14px',
+                          paddingRight: '34px',
+                          borderRadius: '8px',
+                          fontSize: '13px',
+                          fontWeight: isActive ? 600 : 500,
+                          color: isActive ? '#C89B5A' : '#7A8490',
+                          textDecoration: 'none',
+                          marginBottom: '2px',
+                          background: isActive ? 'rgba(200,155,90,0.08)' : 'transparent',
+                          borderRight: isActive ? '3px solid #C89B5A' : '3px solid transparent',
+                        })}
+                      >
+                        <LayoutGrid size={14} />
+                        <span>{child.label}</span>
+                      </NavLink>
+                    ))}
+                  </div>
+                )}
+              </div>
             )
+            return content
           })}
         </nav>
 

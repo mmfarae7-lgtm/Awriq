@@ -5,3 +5,6 @@ verify_jwt = false
 
 [functions.heartbeat]
 verify_jwt = false
+
+[functions.project-access]
+verify_jwt = false

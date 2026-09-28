@@ -72,7 +72,7 @@ export default function Header({ onMenuClick, onToggleFullscreen, isFullscreen }
       position: 'sticky',
       top: 0,
       zIndex: 30,
-    }}>
+    }} className="app-header">
       {/* Menu button - mobile */}
       <button
         onClick={onMenuClick}
@@ -90,7 +90,7 @@ export default function Header({ onMenuClick, onToggleFullscreen, isFullscreen }
       </button>
 
       {/* Search */}
-      <div style={{ flex: 1, maxWidth: '500px', position: 'relative' }}>
+      <div style={{ flex: 1, maxWidth: '500px', position: 'relative' }} className="app-header-search">
         <Search size={18} style={{ position: 'absolute', right: '12px', top: '50%', transform: 'translateY(-50%)', color: 'var(--awriq-secondary)' }} />
         <input
           type="text"
@@ -143,6 +143,7 @@ export default function Header({ onMenuClick, onToggleFullscreen, isFullscreen }
             justifyContent: 'center',
             transition: 'background 0.2s',
           }}
+          className="app-header-fullscreen"
           onMouseEnter={(e) => e.currentTarget.style.background = 'var(--awriq-bg)'}
           onMouseLeave={(e) => e.currentTarget.style.background = 'transparent'}
           title={isFullscreen ? 'إنهاء ملء الشاشة' : 'ملء الشاشة'}
@@ -198,7 +199,8 @@ export default function Header({ onMenuClick, onToggleFullscreen, isFullscreen }
               position: 'absolute',
               top: 'calc(100% + 8px)',
               left: 0,
-              width: '360px',
+              width: '380px',
+              maxWidth: 'calc(100vw - 24px)',
               background: 'var(--awriq-surface)',
               border: '1px solid var(--awriq-border)',
               borderRadius: '12px',
@@ -284,7 +286,7 @@ export default function Header({ onMenuClick, onToggleFullscreen, isFullscreen }
             }}>
               {displayName.charAt(0)}
             </div>
-            <div style={{ textAlign: 'right' }}>
+            <div style={{ textAlign: 'right' }} className="app-header-user-details">
               <div style={{ fontSize: '13px', fontWeight: 600, color: 'var(--awriq-text)' }}>{displayName}</div>
               <div style={{ fontSize: '11px', color: 'var(--awriq-secondary)' }}>{roleLabel}</div>
             </div>

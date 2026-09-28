@@ -16,8 +16,11 @@ import SettingsPage from './pages/SettingsPage'
 import SupportPage from './pages/SupportPage'
 import AgentRoomPage from './pages/AgentRoomPage'
 import ProjectsPage from './pages/ProjectsPage'
+import ProjectDetailsPage from './pages/ProjectDetailsPage'
 import AccessTokensPage from './pages/AccessTokensPage'
+import ProjectAccessPage from './pages/ProjectAccessPage'
 import SecurityPage from './pages/SecurityPage'
+import AIProvidersPage from './pages/AIProvidersPage'
 
 function FullScreenLoader() {
   return (
@@ -66,8 +69,11 @@ function ProtectedRoutes() {
         <Route path="support" element={<SupportPage />} />
         <Route path="agent-room" element={<AgentRoomPage />} />
         <Route path="projects" element={<ProjectsPage />} />
+        <Route path="projects/:id" element={<ProjectDetailsPage />} />
         <Route path="access-tokens" element={<AccessTokensPage />} />
+        <Route path="project-access" element={<ProjectAccessPage />} />
         <Route path="security" element={<SecurityPage />} />
+        <Route path="ai-providers" element={<AIProvidersPage />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>
     </Routes>
