@@ -4,7 +4,7 @@
 
 import { createClient } from "jsr:@supabase/supabase-js@2";
 import { DeepSeekProvider, OpenAICompatProvider, ProviderError, type ChatMessage, type ProviderStep } from "./providers.ts";
-import { runTool, TOOL_DEFS, type AgentToolCtx } from "./tools.ts";
+import { runTool, TOOL_DEFS, applyApproval, type AgentToolCtx } from "./tools.ts";
 
 const ALLOWED_ORIGINS = ["https://awriq-awriq1.vercel.app", "http://localhost:5173"];
 
@@ -84,38 +84,46 @@ type TaskId = "db" | "code" | "git" | "deploy" | "repo";
 
 const TASK: Record<TaskId, { strategy: string; tools: string[]; budget: number }> = {
   db: {
-    strategy: "خطة بيانات (DB-first): كل مدارس/مؤسسات/جلسات/سجلات = جداول قاعدة بيانات AWRIQ. استخدم db_select مباشرة؛ لا تمسح ملفات ولا تبحث في مستودعات عن بيانات. إن وجدت ثم طُلبت بيانات أخرى (جلسات/طلاب) فاسألها من DB. لأمر حذف: db_select للبحث ثم db_delete وتوقف لموافقة.",
-    tools: ["db_select", "db_delete"],
+    strategy: "خطة بيانات (DB-first): كل مدارس/مؤسسات/جلسات/سجلات = جداول قاعدة بيانات AWRIQ. استخدم db_select (مع where/like) ثم db_describe عند الحاجة. لا تمسح ملفات ولا تبحث في مستودعات عن بيانات. لأمر حذف: db_select للبحث ثم db_delete وتوقف لموافقة.",
+    tools: ["db_select", "db_describe", "db_delete"],
     budget: 6,
   },
   code: {
-    strategy: "خطة كود: حدد الملفات المستهدفة أولاً (search_files داخل مجلد محدد أو read_file لمسار معروف)، ثم عدّل بـ edit_file. لا تسرد جذور المشاريع ولا تمسح كل الملفات. تحقق read_file بعد أي تعديل، وrun_command (نحو build/test) للتحقق.",
-    tools: ["list_files", "read_file", "search_files", "edit_file", "git_status", "git_diff", "run_command"],
+    strategy: "خطة كود: حدد الملفات المستهدفة (search_files داخل مجلد محدد أو read_file لمسار معروف)، ثم عدّل بـ edit/patch أو أنشئ بـ write. تحقق read_file بعد أي تعديل، وشغّل التحقق عبر setup_shell ثم shell (build/test). عمليات حذف ملف (rm) حساسة وتتوقف لموافقة. لا تسرد جذور المشاريع.",
+    tools: ["list_files", "read_file", "search_files", "edit", "write", "patch", "rm", "shell", "setup_shell", "git_status", "git_diff", "github_repo"],
     budget: 14,
   },
   git: {
-    strategy: "خطة Git: اقرأ الحالة/الفرق والأدوات المباشرة. لا تعدّل ملفات إلا أن تطلب المهمة.",
-    tools: ["git_status", "git_diff", "read_file", "list_files"],
-    budget: 5,
+    strategy: "خطة Git: اقرأ الحالة/الفرق/الفروع وعمليات الفرع (git_branch/git_checkout). الدفع (git_push) حساس ويتوقف لموافقة. لا تعدّل ملفات إلا أن تطلب المهمة.",
+    tools: ["git_status", "git_diff", "git_branch", "git_checkout", "git_push", "read_file", "list_files", "github_repo"],
+    budget: 6,
   },
   deploy: {
-    strategy: "خطة نشر: تحقق من آخر النشرات ثم أبلغ الحالة. لا تنشر ما لم تطلب المهمة صراحةً.",
-    tools: ["vercel_list", "git_status", "read_file", "list_files"],
+    strategy: "خطة نشر: تحقق من آخر النشرات (vercel_list) ثم أبلغ الحالة. النشر الفعلي (vercel_deploy) حساس ويتوقف لموافقة. لا تنشر ما لم تطلب المهمة صراحةً.",
+    tools: ["vercel_list", "vercel_deploy", "git_status", "read_file", "list_files", "github_repo"],
     budget: 5,
   },
   repo: {
-    strategy: "خطة تصفّح: استخدم list_files لمجلد محدد و read_file/search_files للوصول الدقيق. لا تمسح جذر المشروع أو كل الملفات.",
-    tools: ["list_files", "read_file", "search_files", "git_status"],
+    strategy: "خطة تصفّح: استخدم list_files لمجلد محدد و read_file/search_files للوصول الدقيق و git_status/github_repo للمستودع و db_describe للجداول. لا تمسح جذر المشروع أو كل الملفات.",
+    tools: ["list_files", "read_file", "search_files", "git_status", "git_branch", "github_repo", "db_describe"],
     budget: 8,
   },
 };
 
 function classifyMessage(msg: string): TaskId {
   const t = msg ?? "";
-  const db = ["مدرس", "مدارس", "مؤسسة", "مؤسسات", "طالب", "طلاب", "جلسة", "جلسات", "معلم", "سجل", "بيانات", "حذف", "احذف", "إضافة", "عرض", "كم عدد", "تعريف", "أسماء"].filter((k) => t.includes(k)).length;
-  const code = ["login", "إصلاح", "مشكلة", "خطأ", "bug", "ميزة", "feature", "كود", "دالة", "تعمل", "فحص", "بحث عن", "لماذا"].filter((k) => t.includes(k)).length;
-  const git = ["status", "commit", "التزام", "فرع", "push", "diff", "تاريخ"].filter((k) => t.includes(k)).length;
-  const dep = ["نشر", "deploy", "vercel", "إطلاق", "back to live", "production"].filter((k) => t.toLowerCase().includes(k)).length;
+  const count = (arr: string[]) => arr.filter((k) => t.includes(k)).length;
+  // كلمات البيانات: لا تُحسب كمهمة بيانات إلا مع كلمة بيانات فعلية
+  const dbNouns = ["مدرس", "مؤسسات", "مؤسسة", "طالب", "طلاب", "جلسة", "جلسات", "معلم", "سجل", "بيانات", "جدول", "قاعدة بيانات", "حضور", "ذكر"];
+  const dbActions = ["حذف", "احذف", "أضف", "إضافة", "عرض", "اعرض", "عدّل", "تعديل", "ابحث", "كم عدد", "تعريف", "أسماء", "قائمة", "أنشئ", "إنشاء"];
+  const codeWords = ["login", "إصلاح", "مشكلة", "خطأ", "bug", "ميزة", "feature", "كود", "دالة", "تعمل", "فحص", "ملف", "مجلد", "مستودع", "اختبار", "build", "test", "npm", "أمر", "shell", "شغّل", "patch", "edit", "write", "اكتب", "ts", "tsx", "css"];
+  const gitWords = ["status", "commit", "التزام", "فرع", "branch", "push", "merge", "دمج", "diff", "checkout"];
+  const depWords = ["نشر", "deploy", "vercel", "إطلاق", "production", "back to live"];
+  const dbN = count(dbNouns);
+  const db = dbN > 0 ? dbN + count(dbActions) : 0;
+  const code = count(codeWords);
+  const git = count(gitWords);
+  const dep = count(depWords);
   const scores: Array<[TaskId, number]> = [["db", db], ["code", code], ["git", git], ["deploy", dep]];
   const top = scores.sort((a, b) => b[1] - a[1])[0];
   return top[1] > 0 ? top[0] : "repo";
@@ -152,7 +160,7 @@ function buildSystem(project: any, mode: string, repo: { owner: string; repo: st
 - البيانات (مدرسة/مؤسسة/جلسة/طالب/سجل) = جداول قاعدة البيانات. مؤسسات = "المدارس". استخدم db_select دائمًا للبيانات، ولا تبحث عن بيانات في المستودعات أبدًا.
 - حذف سجل = db_delete (يطلب موافقة)؛ أي حذف فعلي ينتظر الموافقة.
 - بعد تعديل ملف تحقق (read_file). بعد فشل أمر build/test لا تقل إنها انتهت؛ وضح الفشل واصلحه.
-- العمليات الحساسة (تعديل/حذف) في وضع الموافقة: استدعِ الأداة بـ apply=ask وتوقف حتى موافقة.
+- العمليات الحساسة (تعديل/حذف ملف، دفع git، نشر، حذف سجل/صف) تطلب موافقة تلقائيًا وتوقف التنفيذ حتى يجري المستخدم القرار — استدعِ الأداة ثم توقف وانتظر.
 - لا تصل إلى مشروع آخر. لا تكشف أسرارًا (توكنات/مفاتيح) في ردودك.
 - عندما تنتهي المهمة بأي نتيجة (نجاح أو فشل) أبلغها بإيجاز ولا تحتفظ بخطوات زائدة.
 
@@ -176,73 +184,21 @@ interface RunRequest {
   repo?: { owner: string; repo: string; branch: string } | null;
   max_steps?: number;
   approve_approval_id?: string | null;
+  reject_approval_id?: string | null;
 }
 
-function b64Utf8(s: string): string {
-  const bytes = new TextEncoder().encode(s);
-  let bin = "";
-  const chunk = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunk) {
-    bin += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, Math.min(i + chunk, bytes.length))));
-  }
-  return btoa(bin);
-}
-
-async function approveAndApply(ctx: AgentToolCtx, approvalId: string): Promise<string> {
-  const { data } = await ctx.supabase.from("agent_approvals").select("payload, project_id").eq("id", approvalId).maybeSingle();
+async function resolveApproval(ctx: AgentToolCtx, approvalId: string, decision: "approve" | "reject"): Promise<string> {
+  const { data } = await ctx.supabase.from("agent_approvals").select("payload, action_type").eq("id", approvalId).maybeSingle();
   if (!data?.payload) return "طلب الموافقة غير معثور عليه.";
   const act: any = data.payload;
-
-  if (act.action === "db_delete") {
-    const table = String(act.table ?? "");
-    const id = String(act.id ?? "");
-    if (!["institutions", "sessions", "institution_admins"].includes(table) || !id) return "طلب حذف غير صالح (جدول/معرف).";
-    const { data: deleted, error } = await ctx.supabase.from(table).delete().eq("id", id).select("*");
-    if (error || !deleted?.length) {
-      const { data: gone } = await ctx.supabase.from(table).select("id").eq("id", id).maybeSingle();
-      if (!gone) {
-        await ctx.supabase.from("agent_approvals").update({ status: "approved", reviewed_at: new Date().toISOString(), reviewed_by: ctx.requestUserId }).eq("id", approvalId);
-        return `السجل (id ${id}) لم يعد موجودًا في ${table} (محذوف مسبقًا). اعتُبر المعتمَد مُنفَّذًا.`;
-      }
-      return `فشل الحذف الفعلي من ${table} (id ${id}): ${error?.message ?? "لا خبر"} — لم يُحذف شيء.`;
-    }
-    const label = String(act.label ?? deleted[0]?.name_ar ?? deleted[0]?.name ?? id);
-    const { data: still } = await ctx.supabase.from(table).select("id").eq("id", id).maybeSingle();
-    await ctx.supabase.from("agent_approvals").update({ status: "approved", reviewed_at: new Date().toISOString(), reviewed_by: ctx.requestUserId }).eq("id", approvalId);
-    return still
-      ? `حُذف ${deleted.length} صف؟ التحقق يشير إلى أنه ما زال موجودًا — فحصّ يدويًا.`
-      : `نُفِّذ الحذف المعتمَد فعليًا: «${label}» من ${table} (id ${id}) وحُذفت. الموافقة ${approvalId.slice(0, 8)}.`;
+  if (decision === "reject") {
+    const { error: uerr } = await ctx.supabase.from("agent_approvals").update({ status: "rejected", reviewed_at: new Date().toISOString(), reviewed_by: ctx.requestUserId }).eq("id", approvalId);
+    if (uerr) return `لم يُحفظ رفض الموافقة: ${uerr.message}`;
+    return `رفضت الموافقة — لم يُنفَّذ أي تغيير للعملية «${String(act.action ?? data.action_type ?? "؟")}».`;
   }
-
-  const from = String(act.path ?? "").split("/");
-  const enc = from.map(encodeURIComponent).join("/");
-  let sha: string | null = null;
-  try {
-    const existing = await ghGet(ctx, `/repos/${ctx.repo!.owner}/${ctx.repo!.repo}/contents/${enc}?ref=${encodeURIComponent(ctx.repo!.branch)}`);
-    sha = existing?.sha ?? null;
-  } catch (e: any) {
-    if (String(e?.message ?? "").includes("404")) sha = null;
-    else throw e;
-  }
-  const commit = await ghGet(ctx, `/repos/${ctx.repo!.owner}/${ctx.repo!.repo}/contents/${enc}`, {
-    method: "PUT",
-    body: JSON.stringify({ message: String(act.commit_message ?? "AWRIQ Agent (معتمَد)"), content: b64Utf8(String(act.new_content ?? "")), sha: sha ?? undefined, branch: ctx.repo!.branch }),
-  });
-  if (!commit?.content?.sha) return `فشل التطبيق بعد الموافقة على ${act.path}.`;
+  const applied = await applyApproval(ctx, act);
   await ctx.supabase.from("agent_approvals").update({ status: "approved", reviewed_at: new Date().toISOString(), reviewed_by: ctx.requestUserId }).eq("id", approvalId);
-  return `نُفّذ التعديل المعتمَد على ${act.path} (الموافقة ${approvalId.slice(0, 8)}).`;
-}
-
-export async function ghGet(ctx: AgentToolCtx, path: string, init?: RequestInit): Promise<any> {
-  const res = await fetch(`https://api.github.com${path}`, {
-    ...init,
-    headers: { accept: "application/vnd.github+json", "user-agent": "AWRIQ-Agent/1.0", ...(ctx.gitToken ? { authorization: `Bearer ${ctx.gitToken}` } : {}), ...(init?.headers ?? {}) },
-  });
-  const text = await res.text();
-  let b: any = null;
-  try { b = text ? JSON.parse(text) : null; } catch { b = text; }
-  if (!res.ok) throw new Error(`GitHub ${res.status}: ${b?.message ?? b}`);
-  return b;
+  return applied;
 }
 
 async function runOnce(body: RunRequest, user: { id: string; roles: string[]; projectIds: string[] }): Promise<Response> {
@@ -300,7 +256,45 @@ async function runOnce(body: RunRequest, user: { id: string; roles: string[]; pr
       const runId = crypto.randomUUID();
       const deadline = started + 170_000;
       const profile = await getProjectProfile(String(project.id));
-      await sse.emit("run.start", { runId, task, tools: tmeta.tools, maxSteps, toolCap, deadlineMs: deadline - started, strategy: tmeta.strategy });
+
+      // نظام prompt + رسائل
+      const EMPTY_USAGE = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+      const system = buildSystem(project, mode, repo, task, profile);
+      const history = (body.history ?? []).slice(-40).map((h) => ({ ...h }));
+      const messages: ChatMessage[] = [{ role: "system", content: system }, ...history];
+
+      let totalUsage = { ...EMPTY_USAGE };
+      let finalText = "";
+      const actions: any[] = [];
+      const filesChanged: string[] = [];
+      const commands: string[] = [];
+      let status: string = "success";
+      let lastError: string | null = null;
+      let waitingApproval = false;
+      let toolCalls = 0;
+      let resolvedLabel: string | undefined;
+      let emptyRetries = 0;
+
+      // قرار موافقة معلّق (موافقة/رفض) قبل بدء حلقة الوكيل
+      if (body.approve_approval_id || body.reject_approval_id) {
+        const decision = body.approve_approval_id ? "approve" : "reject";
+        const aid = String(body.approve_approval_id ?? body.reject_approval_id);
+        const resolved = await resolveApproval(ctx, aid, decision);
+        await sse.emit("approval.resolved", { id: aid, decision, text: resolved });
+        if (decision === "reject") {
+          await sse.emit("agent.completed", { provider: "AWRIQ", text: resolved, usage: EMPTY_USAGE, costEst: estimateCost(EMPTY_USAGE), durationMs: Date.now() - started, rejected: true });
+          return;
+        }
+        await sse.emit("run.start", { runId, task, tools: tmeta.tools, maxSteps, toolCap, deadlineMs: deadline - started, strategy: tmeta.strategy, approval: aid });
+        await sse.emit("message.start", { runId, step: 1, task, approval: aid });
+        messages.push({ role: "user", content: `قرار الموافقة: ${resolved} — تابع باقي المهمة بصدق وبالتحقق الفعلي.` });
+      } else {
+        await sse.emit("run.start", { runId, task, tools: tmeta.tools, maxSteps, toolCap, deadlineMs: deadline - started, strategy: tmeta.strategy });
+        await sse.emit("message.start", { runId, step: 1, task });
+        if (body.message && body.message.trim()) {
+          messages.push({ role: "user", content: body.message.trim() });
+        }
+      }
 
       // provider chain: DeepSeek أولاً (env) ثم سلسلة الخزنة
       const chain: Array<{ label: string; stream: (msgs: ChatMessage[]) => Promise<ProviderStep> }> = [];
@@ -308,7 +302,7 @@ async function runOnce(body: RunRequest, user: { id: string; roles: string[]; pr
         const ds = new DeepSeekProvider(DEEPSEEK_KEY, DEEPSEEK_MODEL);
         chain.push({
           label: ds.label,
-          stream: (msgs) => ds.stream(msgs, { tools: allowedDefs as any, maxTokens: 4096 }),
+          stream: (msgs) => ds.stream(msgs, { tools: allowedDefs as any, maxTokens: 8192 }),
         });
       }
       const { data: provRows } = await supabase.from("ai_providers").select("id, code, name, base_url, config").eq("is_enabled", true).order("priority", { ascending: true });
@@ -321,30 +315,8 @@ async function runOnce(body: RunRequest, user: { id: string; roles: string[]; pr
         const model = p.code === "gemini" ? "gemini-2.5-flash" : null;
         if (!model) continue;
         const prov = new OpenAICompatProvider({ base: p.base_url, apiKey, model, label: p.name ?? p.code });
-        chain.push({ label: prov.label, stream: (msgs) => prov.stream(msgs, { tools: allowedDefs as any, maxTokens: 4096 }) });
+        chain.push({ label: prov.label, stream: (msgs) => prov.stream(msgs, { tools: allowedDefs as any, maxTokens: 8192 }) });
       }
-
-      // نظام prompt + رسائل
-      const system = buildSystem(project, mode, repo, task, profile);
-      const history = (body.history ?? []).slice(-40).map((h) => ({ ...h }));
-      const messages: ChatMessage[] = [{ role: "system", content: system }, ...history];
-      if (body.approve_approval_id) {
-        const applied = await approveAndApply(ctx, String(body.approve_approval_id));
-        messages.push({ role: "user", content: `تنفيذ بعد الموافقة: ${applied} — تابع باقي المهمة بصدق.` });
-      } else if (body.message && body.message.trim()) {
-        messages.push({ role: "user", content: body.message.trim() });
-      }
-
-      let totalUsage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
-      let finalText = "";
-      const actions: any[] = [];
-      const filesChanged: string[] = [];
-      const commands: string[] = [];
-      let status: string = "success";
-      let lastError: string | null = null;
-      let waitingApproval = false;
-      let toolCalls = 0;
-      let resolvedLabel: string | undefined;
 
       for (let step = 0; step < maxSteps; step++) {
         const elapsed = Date.now() - started;
@@ -358,6 +330,7 @@ async function runOnce(body: RunRequest, user: { id: string; roles: string[]; pr
 
         let resolved: { label: string; step: ProviderStep } | null = null;
         let chainErr: { kind: string; msg: string } | null = null;
+        const chainLog: string[] = [];
         for (const p of chain) {
           try {
             const s = await p.stream(messages);
@@ -366,12 +339,13 @@ async function runOnce(body: RunRequest, user: { id: string; roles: string[]; pr
           } catch (e) {
             const kind = e instanceof ProviderError ? e.kind : "unknown";
             chainErr = { kind, msg: e instanceof Error ? e.message : String(e) };
+            chainLog.push(`${p.label}: ${chainErr.msg}`);
           }
         }
         if (!resolved) {
           status = "error";
           lastError = `All AI providers failed. آخر خطأ: ${chainErr?.msg ?? "غير معروف"}`;
-          await sse.emit("agent.error", { message: chainErr?.msg ?? "DeepSeek request failed.", kind: chainErr?.kind ?? "unknown" });
+          await sse.emit("agent.error", { message: `${chainLog.join(" | ")}`, kind: chainErr?.kind ?? "unknown" });
           return;
         }
         const { label, step: providerStep } = resolved;
@@ -380,8 +354,16 @@ async function runOnce(body: RunRequest, user: { id: string; roles: string[]; pr
         if (providerStep.text) await sse.emit("assistant.delta", { text: providerStep.text });
 
         if (providerStep.toolCalls.length === 0) {
-          finalText = providerStep.text;
-          await sse.emit("agent.completed", { provider: label, text: finalText, usage: totalUsage, costEst: estimateCost(totalUsage), durationMs: Date.now() - started });
+          const txt = providerStep.text?.trim();
+          const canRetry = !txt && emptyRetries < 2 && toolCalls < toolCap && Date.now() < deadline;
+          if (canRetry) {
+            emptyRetries++;
+            messages.push({ role: "assistant", content: "" });
+            messages.push({ role: "user", content: "لم يصل ردّ نصي. نفّذ الأدوات اللازمة للمهمة الآن، وإن انتهت فاذكر النتيجة النهائية بوضوح في سطرين." });
+            continue;
+          }
+          finalText = txt || `لم يُرجع النموذج ردًا نصيًا. ما نُفِّذ فعليًا: ${actions.length ? actions.map((a) => `${a.tool}:${a.ok ? "نجاح" : "فشل"}`).join("، ") : "لا شيء بعد"}. أعد صياغة الطلب أو اطلب استمرارًا.`;
+          await sse.emit("agent.completed", { provider: label, text: finalText, usage: totalUsage, costEst: estimateCost(totalUsage), durationMs: Date.now() - started, emptyText: !txt });
           break;
         }
 
@@ -397,8 +379,12 @@ async function runOnce(body: RunRequest, user: { id: string; roles: string[]; pr
           }
           for (const ev of result.events) {
             if (ev.fileChanged) { filesChanged.push(ev.fileChanged.path); await sse.emit("file.changed", ev.fileChanged); }
-            if (ev.approvalRequired) { waitingApproval = true; await sse.emit("approval.required", ev.approvalRequired); }
-            if (ev.commandDispatched) { commands.push(String(ev.commandDispatched.workflow)); await sse.emit("command.dispatched", ev.commandDispatched); }
+            if (ev.approvalRequired) {
+              waitingApproval = true;
+              await sse.emit("approval.required", { ...ev.approvalRequired, project: { id: String(project.id), name: String(project.name ?? "") } });
+            }
+            if (ev.commandDispatched) { await sse.emit("command.dispatched", ev.commandDispatched); }
+            if (ev.terminal) { commands.push(ev.terminal.command); await sse.emit("terminal", ev.terminal); }
           }
           await sse.emit("tool.completed", { id: tc.id, name: tc.name, ok: result.ok, output: unsafePreview(result.output), errorType: result.errorType, statusCode: result.statusCode ?? null, durationMs: result.durationMs ?? null, retried: result.retried ?? false });
           actions.push({ tool: tc.name, ok: result.ok, errorType: result.errorType ?? null });

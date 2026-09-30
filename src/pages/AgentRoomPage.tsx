@@ -12,7 +12,7 @@ import { useToast } from '../lib/toast'
 import { useAuth } from '../lib/auth'
 import { aiGateway } from '../lib/ai'
 import type { AIModel, AIProvider, AiToolCall, ChatMessage as LlmMessage } from '../lib/ai'
-import { runServerAgent, approveServerApproval, type AgentServerMode } from '../lib/ai/agentServer'
+import { runServerAgent, approveServerApproval, rejectServerApproval, type AgentServerMode, type AgentServerEvents } from '../lib/ai/agentServer'
 import { AGENT_TOOLS, execAgentTool } from '../lib/ai/agentTools'
 import {
   parseGithubUrl, listGithubTree, readGithubFile, shouldShowPlain, commitGithubFiles,
@@ -203,7 +203,8 @@ export default function AgentRoomPage() {
   const [activeTab, setActiveTab] = useState<TabKey>('chat')
   const [tasks, setTasks] = useState<AgentTask[]>([])
   const [approvals, setApprovals] = useState<AgentApproval[]>([])
-  const [terminalOutput, setTerminalOutput] = useState<{ command: string; output: string; exitCode: number | null }[]>([])
+  const [terminalOutput, setTerminalOutput] = useState<{ command: string; output: string; exitCode: number | null; status?: string; runUrl?: string }[]>([])
+  const [liveDiffs, setLiveDiffs] = useState<{ path: string; diff: string; action: string; at: string }[]>([])
   const [logs, setLogs] = useState<{ level: string; message: string; timestamp: string }[]>([])
 
   // AI providers/models
@@ -287,6 +288,40 @@ export default function AgentRoomPage() {
   const addMessage = (role: 'user' | 'agent' | 'system', content: string, extra?: { actions?: string[]; files?: string[]; provider?: string; model?: string }) => {
     setMessages(prev => [...prev, { id: Date.now().toString() + Math.random(), role, content, timestamp: new Date().toISOString(), ...extra }])
   }
+
+  // موزّع أحداث وكيل الخادم: نشاط حقيقي في المحادثة + طرفية حقيقية + فروق حقيقية
+  const serverEvents = (opts: { readFilesSet: Set<string>; onDeltaText?: (full: string) => void }): AgentServerEvents => ({
+    onDelta: (t) => opts.onDeltaText?.(t),
+    onToolStart: (id, name) => { upsertChip({ id, name }); addLog('info', `أداة خادم: ${name}`) },
+    onToolDone: (id, name, toolOk, output, meta) => {
+      settleChip(id, toolOk, summarizeToolResult(output))
+      addLog(toolOk ? 'info' : 'warning', `${name} ${toolOk ? 'نجح' : 'فشل'}${meta?.durationMs ? ` (${meta.durationMs}ms)` : ''}${meta?.retried ? ' [أُعيد المحاولة]' : ''}${meta?.statusCode ? ` [HTTP ${meta.statusCode}]` : ''}`)
+    },
+    onApproval: (d: any) => {
+      setAgentStatus('waiting_approval')
+      addMessage('system', `طلب موافقة (${d?.risk_level === 'high' ? 'خطورة عالية' : 'متوسطة'}): ${d?.description ?? ''}${d?.project?.name ? ` — المشروع: ${d.project.name}` : ''}`)
+      addLog('warning', `موافقة مطلوبة: ${d?.id ?? ''} — ${d?.description ?? ''}`)
+      void refreshChanges()
+    },
+    onApprovalResolved: (d: any) => {
+      addLog(d?.decision === 'reject' ? 'warning' : 'info', `قرار الموافقة ${d?.decision === 'reject' ? 'رفض' : 'قبول'}: ${d?.text ?? ''}`)
+      void refreshChanges()
+    },
+    onFileChanged: (p, diff) => {
+      opts.readFilesSet.add(p)
+      if (diff) setLiveDiffs(prev => [{ path: p, diff, action: 'modified', at: new Date().toISOString() }, ...prev].slice(0, 20))
+      addLog('info', `تغيّر ملف فعليًا: ${p}`)
+    },
+    onDiff: (p, diff, action) => { if (diff) setLiveDiffs(prev => [{ path: p, diff, action: action ?? 'modified', at: new Date().toISOString() }, ...prev].slice(0, 20)) },
+    onCommandDispatched: (wf) => addLog('info', `مهمة أُطلقت عبر GitHub Actions: ${wf}`),
+    onTerminal: (t) => {
+      setTerminalOutput(prev => [{ command: t.command, output: t.output ?? '', exitCode: t.exitCode, status: t.status, runUrl: t.runUrl }, ...prev].slice(0, 25))
+      addLog(t.exitCode === 0 ? 'info' : 'warning', `shell: ${t.command} → exit ${t.exitCode}`)
+    },
+    onRunStart: (d: any) => { setAgentStatus('working'); addLog('info', `بدء تشغيل: مهمة=${d?.task} ميزانية=${d?.toolCap}`) },
+    onMessageStart: () => { setAgentStatus('working') },
+    onError: (msg, kind) => { addLog('error', `وكيل الخادم: ${msg}${kind ? ` (${kind})` : ''}`); setAgentStatus('failed') },
+  })
 
   async function persistMessage(sessionId: string, sender: 'user' | 'agent' | 'system', content: string, meta?: { attachments?: string[]; actions?: string[]; provider?: string; model?: string; modelId?: string }) {
     const { error } = await supabase.from('agent_messages').insert({
@@ -483,21 +518,42 @@ export default function AgentRoomPage() {
 
     // Server-created approvals carry a `payload`; delegation runs apply + mark inside awriq-agent.
     if ((approval as unknown as { payload?: unknown }).payload) {
+      setCommitBusy(true)
       if (!approve) {
-        const { error } = await supabase.from('agent_approvals').update({ status, reviewed_by: authSession.user.id, reviewed_at: new Date().toISOString() }).eq('id', approval.id)
-        if (error) showToast('فشل تحديث الموافقة: ' + error.message, 'error')
-        await refreshChanges()
+        try {
+          const res = await rejectServerApproval({ project_id: selectedProject!.id, approval_id: approval.id })
+          if (!res.ok) throw new Error(res.message ?? 'فشل رفض الموافقة')
+          addLog('warning', `رُفض طلب ${approval.id.slice(0, 8)} — لم يُنفَّذ أي تغيير`)
+          showToast('رُفض الطلب — لم يُنفَّذ أي تغيير', 'success')
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err)
+          addLog('error', `reject server approval: ${msg}`)
+          showToast('فشل حفظ الرفض: ' + msg, 'error')
+        } finally {
+          setCommitBusy(false)
+          await refreshChanges()
+        }
         return
       }
-      setCommitBusy(true)
+      setAgentStatus('working')
+      const approvalRunFiles = new Set<string>()
+      const approvalBubble = { text: '' }
       try {
-        const res = await approveServerApproval({ project_id: selectedProject!.id, approval_id: approval.id, mode: serverModeFor(mode) })
+        const res = await approveServerApproval({
+          project_id: selectedProject!.id,
+          approval_id: approval.id,
+          mode: serverModeFor(mode),
+          onEvent: serverEvents({ readFilesSet: approvalRunFiles, onDeltaText: (t) => { approvalBubble.text += t } }),
+        })
         if (!res.ok) throw new Error(res.message ?? 'فشل تطبيق الموافقة')
+        setAgentStatus('completed')
         addLog('info', `تطبيق موافقة الخادم ${approval.id.slice(0, 8)} عبر awriq-agent`)
-        showToast('نُفّذ التعديل المعتمَد من الخادم', 'success')
+        if (approvalBubble.text.trim()) addMessage('agent', approvalBubble.text.trim(), { actions: ['server_approval'], provider: 'DeepSeek', model: 'server' })
+        showToast('نُفّذ القرار من الخادم فعليًا', 'success')
         if (repoRef.branch === 'HEAD') void loadTree(repoRef, selectedProject!.id)
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
+        setAgentStatus('failed')
         addLog('error', `apply server approval: ${msg}`)
         showToast('فشل تطبيق التغييرات: ' + msg, 'error')
       } finally {
@@ -620,15 +676,7 @@ export default function AgentRoomPage() {
           history: messages.slice(-10).map(m => ({ role: (m.role === 'agent' ? 'assistant' : m.role) as LlmMessage['role'], content: m.content })),
           maxSteps: maxIter,
           signal,
-          onEvent: {
-            onDelta: (t) => { fullText += t; updateBubble(fullText) },
-            onToolStart: (id, name) => { upsertChip({ id, name }); addLog('info', `أداة خادم: ${name}`) },
-            onToolDone: (id, _name, toolOk, output) => { settleChip(id, toolOk, summarizeToolResult(output)) },
-            onApproval: () => { setAgentStatus('waiting_approval'); addMessage('system', 'الوكيل اقترح تعديلاً ينتظر موافقتك — راجع «Git/الفرق».'); void refreshChanges() },
-            onFileChanged: (p) => readFilesSet.add(p),
-            onCommandDispatched: (wf) => addLog('info', `مهمة أُطلقت عبر GitHub Actions: ${wf}`),
-            onError: (msg, kind) => addLog('error', `وكيل الخادم: ${msg}${kind ? ` (${kind})` : ''}`),
-          },
+          onEvent: serverEvents({ readFilesSet, onDeltaText: (t) => { fullText += t; updateBubble(fullText) } }),
         })
         if (signal.aborted) {
           setAgentStatus('stopped'); setIterationLabel(''); addLog('warning', 'إيقاف الوكيل أثناء العمل')
@@ -1393,11 +1441,16 @@ export default function AgentRoomPage() {
                 {terminalOutput.length > 0 && (
                   <div style={{ background: '#0D1218', borderRadius: '8px', padding: '16px', fontFamily: 'monospace', fontSize: '12px' }}>
                     {terminalOutput.map((cmd, i) => (
-                      <div key={i} style={{ marginBottom: '12px' }}>
-                        <div style={{ color: '#C89B5A', marginBottom: '4px' }}>$ {cmd.command}</div>
-                        <pre style={{ color: '#E6DED3', margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{cmd.output}</pre>
+                      <div key={i} style={{ marginBottom: '12px', borderBottom: '1px solid rgba(255,255,255,0.05)', paddingBottom: '10px' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', gap: '8px', flexWrap: 'wrap' }}>
+                          <span style={{ color: '#C89B5A', direction: 'ltr', textAlign: 'left' }}>Command: $ {cmd.command}</span>
+                          {cmd.runUrl && <a href={cmd.runUrl} target="_blank" rel="noopener noreferrer" style={{ color: '#4F8A5B', fontSize: '11px' }}>سجل التشغيل (Actions)</a>}
+                        </div>
+                        <div style={{ color: '#8A949E', fontSize: '11px', margin: '4px 0' }}>Output:</div>
+                        <pre style={{ color: '#E6DED3', margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word', direction: 'ltr', textAlign: 'left' }}>{cmd.output || '(لا مخرجات)'}</pre>
                         <div style={{ display: 'flex', gap: '12px', fontSize: '11px', color: '#68727A', marginTop: '4px' }}>
-                          <span style={{ color: cmd.exitCode === 0 ? '#4F8A5B' : '#C94B4B' }}>Exit: {cmd.exitCode}</span>
+                          <span style={{ color: cmd.exitCode === 0 ? '#4F8A5B' : '#C94B4B' }}>Exit code: {cmd.exitCode ?? '—'}</span>
+                          <span style={{ color: cmd.exitCode === 0 ? '#4F8A5B' : '#C94B4B' }}>Status: {cmd.status ?? (cmd.exitCode === 0 ? 'success' : 'failed')}</span>
                         </div>
                       </div>
                     ))}
@@ -1408,6 +1461,26 @@ export default function AgentRoomPage() {
 
             {activeTab === 'diff' && (
               <div style={{ flex: 1, overflow: 'auto', padding: '16px' }}>
+                {liveDiffs.length > 0 && (
+                  <div style={{ marginBottom: '20px' }}>
+                    <div style={{ fontSize: '13px', fontWeight: 700, color: 'var(--awriq-text)', marginBottom: '8px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                      <FileCode size={14} color="#C89B5A" /> فروق حقيقية من تنفيذ الوكيل في هذه الجلسة
+                    </div>
+                    {liveDiffs.map((d, i) => (
+                      <div key={`${d.path}-${i}`} className="awriq-card" style={{ padding: '14px', marginBottom: '10px', border: '1px solid rgba(200,155,90,0.3)' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', gap: '8px', flexWrap: 'wrap', marginBottom: '8px' }}>
+                          <span style={{ fontFamily: 'monospace', fontSize: '12px', color: 'var(--awriq-text)', direction: 'ltr' }}>{d.path}</span>
+                          <span style={{ fontSize: '11px', color: '#C89B5A' }}>{d.action === 'created' ? 'أُنشئ' : d.action === 'deleted' ? 'حُذف' : 'عُدّل'} · {new Date(d.at).toLocaleTimeString('ar-EG')}</span>
+                        </div>
+                        <pre style={{ background: '#0D1218', color: '#E6DED3', borderRadius: '6px', padding: '12px', fontSize: '12px', lineHeight: 1.55, overflowX: 'auto', margin: 0, direction: 'ltr', textAlign: 'left' }}>
+                          {d.diff.split('\n').map((l, k) => (
+                            <div key={k} style={{ color: l.startsWith('+') && !l.startsWith('+++') ? '#7FC9A0' : l.startsWith('-') && !l.startsWith('---') ? '#E08E8E' : l.startsWith('@@') ? '#C89B5A' : '#8A949E', whiteSpace: 'pre-wrap' }}>{l}</div>
+                          ))}
+                        </pre>
+                      </div>
+                    ))}
+                  </div>
+                )}
                 {fileChanges.length === 0 ? (
                   <div style={{ textAlign: 'center', padding: '48px', color: 'var(--awriq-secondary)', fontSize: '14px' }}>
                     <GitBranch size={40} color="var(--awriq-border)" style={{ margin: '0 auto 12px' }} />
