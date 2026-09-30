@@ -1,0 +1,57 @@
+name: AWRIQ Run
+on:
+  workflow_dispatch:
+    inputs:
+      command:
+        description: Commands to run in the project workspace
+        required: true
+        type: string
+permissions:
+  contents: write
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Execute
+        env:
+          CMD: ${{ inputs.command }}
+        shell: bash
+        run: |
+          set +e
+          mkdir -p awriq_logs
+          ( eval "$CMD" 2>&1 ; echo "AWRIQ_RC=$?" >&2 ; ) 2> awriq_logs/rc.txt | tee awriq_logs/output.txt
+          code=$(tail -1 awriq_logs/rc.txt 2>/dev/null | sed -nE 's/.*AWRIQ_RC=([0-9]+).*/\1/p')
+          [ -n "$code" ] || code=1
+          printf '%s' "$code" > awriq_logs/exit_code.txt
+          echo "AWRIQ_EXIT_CODE=$code"
+          exit 0
+      - name: Publish logs
+        if: always()
+        env:
+          BRANCH: awriq-logs/${{ github.run_id }}
+        shell: bash
+        run: |
+          set -e
+          mkdir -p .awriq
+          cp awriq_logs/output.txt .awriq/output.txt 2>/dev/null || true
+          cp awriq_logs/exit_code.txt .awriq/exit_code.txt 2>/dev/null || true
+          [ -s .awriq/exit_code.txt ] || printf '3' > .awriq/exit_code.txt
+          git config user.name "AWRIQ Agent"
+          git config user.email "agent@awriq.app"
+          git checkout --orphan "$BRANCH" 2>/dev/null || git checkout "$BRANCH"
+          git add .awriq
+          git commit -q -m "awriq logs ${{ github.run_id }}" || true
+          git push -f origin "$BRANCH" -q || true
+          git checkout -qf "${{ github.sha }}"
+      - name: Exit with result code
+        if: always()
+        shell: bash
+        run: |
+          code=$(cat awriq_logs/exit_code.txt 2>/dev/null)
+          [ -n "$code" ] || code=1
+          exit "$code"
