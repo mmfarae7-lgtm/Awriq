@@ -1199,7 +1199,11 @@ export async function applyApproval(ctx: AgentToolCtx, act: any): Promise<string
     if (!ctx.vercelToken) return "لا اعتماد Vercel.";
     const { target, ref, projectId } = act;
     const repoInfo = ctx.repo ? (await ghGetRepo(ctx)) : null;
-    const body: any = { target, projectId, name: repoInfo?.name ?? undefined, gitSource: repoInfo ? { type: "github", repo: `${ctx.repo!.owner}/${ctx.repo!.repo}`, ref: String(ref ?? "main") } : undefined, force: true };
+    const gitSource = repoInfo?.id
+      ? { type: "github", repoId: Number(repoInfo.id), repo: `${ctx.repo!.owner}/${ctx.repo!.repo}`, ref: String(ref ?? "main") }
+      : undefined;
+    const body: any = { name: repoInfo?.name ?? undefined, project: repoInfo?.name ?? undefined, gitSource };
+    if (target !== "preview") body.target = target;
     const r = await netJson(`https://api.vercel.com/v13/deployments`, {
       method: "POST",
       headers: { authorization: `Bearer ${ctx.vercelToken}`, "content-type": "application/json" },

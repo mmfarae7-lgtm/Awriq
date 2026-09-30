@@ -188,16 +188,18 @@ interface RunRequest {
 }
 
 async function resolveApproval(ctx: AgentToolCtx, approvalId: string, decision: "approve" | "reject"): Promise<string> {
-  const { data } = await ctx.supabase.from("agent_approvals").select("payload, action_type").eq("id", approvalId).maybeSingle();
+  const { data } = await ctx.supabase.from("agent_approvals").select("payload, action_type, status, project_id").eq("id", approvalId).maybeSingle();
   if (!data?.payload) return "طلب الموافقة غير معثور عليه.";
+  if (String(data.project_id) !== String(ctx.projectId)) return "طلب الموافقة لا يخص هذا المشروع — لم يُنفَّذ.";
+  if (data.status !== "pending") return `الطلب مُعالَج مسبقًا (${data.status}) — لم يُنفَّذ مرة أخرى.`;
   const act: any = data.payload;
   if (decision === "reject") {
-    const { error: uerr } = await ctx.supabase.from("agent_approvals").update({ status: "rejected", reviewed_at: new Date().toISOString(), reviewed_by: ctx.requestUserId }).eq("id", approvalId);
+    const { error: uerr } = await ctx.supabase.from("agent_approvals").update({ status: "rejected", reviewed_at: new Date().toISOString(), reviewed_by: ctx.requestUserId }).eq("id", approvalId).eq("status", "pending");
     if (uerr) return `لم يُحفظ رفض الموافقة: ${uerr.message}`;
     return `رفضت الموافقة — لم يُنفَّذ أي تغيير للعملية «${String(act.action ?? data.action_type ?? "؟")}».`;
   }
   const applied = await applyApproval(ctx, act);
-  await ctx.supabase.from("agent_approvals").update({ status: "approved", reviewed_at: new Date().toISOString(), reviewed_by: ctx.requestUserId }).eq("id", approvalId);
+  await ctx.supabase.from("agent_approvals").update({ status: "approved", reviewed_at: new Date().toISOString(), reviewed_by: ctx.requestUserId }).eq("id", approvalId).eq("status", "pending");
   return applied;
 }
 
@@ -243,9 +245,16 @@ async function runOnce(body: RunRequest, user: { id: string; roles: string[]; pr
       // موجه المهام + ميزانيات + الملف الجانبي
       let task: TaskId;
       if (body.approve_approval_id) {
-        const { data: ap } = await supabase.from("agent_approvals").select("payload, action_type").eq("id", String(body.approve_approval_id)).maybeSingle();
-        const aaction = (ap?.payload as any)?.action ?? ap?.action_type;
-        task = aaction === "db_delete" ? "db" : ap?.action_type === "file_modify" ? "code" : "repo";
+        const { data: ap } = await supabase.from("agent_approvals").select("payload, action_type, status, project_id").eq("id", String(body.approve_approval_id)).maybeSingle();
+        if (!ap) { await sse.emit("approval.resolved", { id: String(body.approve_approval_id), decision: "reject", text: "طلب الموافقة غير موجود." }); await sse.emit("agent.error", { message: "Approval not found.", kind: "auth" }); return; }
+        if (String(ap.project_id) !== String(project.id)) { await sse.emit("agent.error", { message: "Approval belongs to another project.", kind: "auth" }); return; }
+        if (ap.status !== "pending") { await sse.emit("approval.resolved", { id: String(body.approve_approval_id), decision: "reject", text: `الطلب مُعالَج مسبقًا (${ap.status}).` }); return; }
+        const aaction = String((ap.payload as any)?.action ?? ap.action_type ?? "");
+        task = aaction === "db_delete" ? "db"
+          : aaction === "vercel_deploy" || ap.action_type === "deploy" ? "deploy"
+          : ap.action_type === "file_modify" ? "code"
+          : aaction.startsWith("git_") || ap.action_type === "git" ? "git"
+          : "repo";
       } else {
         task = classifyMessage(body.message ?? "");
       }
